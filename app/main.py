@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
+from twilio.request_validator import RequestValidator
 
 # =====================
 # Config
@@ -18,6 +19,9 @@ ALLOWED_SENDERS = {
     s.strip() for s in os.getenv("ALLOWED_SENDERS", "").split(",") if s.strip()
 }
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))
+
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+WEBHOOK_PUBLIC_URL = os.getenv("WEBHOOK_PUBLIC_URL", "").strip()
 
 # =====================
 # App
@@ -114,6 +118,12 @@ def rate_limit_ok(sender: str) -> bool:
 def sender_allowed(sender: str) -> bool:
     return sender in ALLOWED_SENDERS
 
+def twilio_signature_ok(request_url:str,form:dict,signature:str) -> bool:
+    #Dev Note: keep local curl tests working until Twilio config is done
+    if not TWILIO_AUTH_TOKEN or not WEBHOOK_PUBLIC_URL:
+        return True
+    validator = RequestValidator(TWILIO_AUTH_TOKEN)
+    return validator.validate(request_url, form, signature)
 # =====================
 # Parsing
 # =====================
@@ -310,6 +320,12 @@ async def whatsapp_webhook(request: Request):
     form = dict(await request.form())
     sender = form.get("From", "")
     body = form.get("Body", "")
+    signature = request.headers.get("X-Twilio-Signature", "")
+    request_url = WEBHOOK_PUBLIC_URL or str(request.url)
+    
+    if not twilio_signature_ok(request_url, form, signature):
+        audit(sender, "AUTH_FAIL", {"reason": "bad_twilio_signature"})
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     audit(sender, "MSG_RECEIVED", {"len": len(body)})
 
