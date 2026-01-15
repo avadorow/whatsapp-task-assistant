@@ -1,0 +1,7 @@
+venv/
+.env
+assistant.db
+_pychache_/
+*.pyc
+
+#This tells git to ignore certain files and directories
