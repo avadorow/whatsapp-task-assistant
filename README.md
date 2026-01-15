@@ -38,4 +38,5 @@ FastAPI Webhook (Internet-facing trust boundary) ->
 Command Parser & Allowlist ->
 SQLite (Tasks, Lists, Preferences, Audit Log)
 
-
+## Security
+This project prioritizes deterministic execution and auditability. See 'SECURITY.md' for full threat model, trust boundaries, and security controls
