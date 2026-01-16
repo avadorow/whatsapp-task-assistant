@@ -35,6 +35,10 @@ Supported Commands:
 
 WhatsApp Client -> Twilio WHatsApp API ->
 FastAPI Webhook (Internet-facing trust boundary) ->
+    -Twilio signature verification
+    -replay protection (MESSAGESid)
+    -sender allow list 
+    rate limiting
 Command Parser & Allowlist ->
 SQLite (Tasks, Lists, Preferences, Audit Log)
 
