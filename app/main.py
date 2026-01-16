@@ -23,6 +23,10 @@ RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 WEBHOOK_PUBLIC_URL = os.getenv("WEBHOOK_PUBLIC_URL", "").strip()
 
+# Set to "1" temporarily to log Twilio form keys / SID fields for verification.
+# Turn back to "0" after confirming.
+DEBUG_TWILIO_FORM_KEYS = os.getenv("DEBUG_TWILIO_FORM_KEYS", "0").strip() == "1"
+
 # =====================
 # App
 # =====================
@@ -82,7 +86,14 @@ def init_db():
     );
     """)
 
-    # ensure default list exists
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS message_dedup (
+        message_sid TEXT PRIMARY KEY,
+        first_seen_ts INTEGER NOT NULL
+    );
+    """)
+
+    # Ensure default list exists
     cur.execute(
         "INSERT OR IGNORE INTO lists (name, created_at) VALUES (?,?)",
         ("todo", now),
@@ -118,12 +129,41 @@ def rate_limit_ok(sender: str) -> bool:
 def sender_allowed(sender: str) -> bool:
     return sender in ALLOWED_SENDERS
 
-def twilio_signature_ok(request_url:str,form:dict,signature:str) -> bool:
-    #Dev Note: keep local curl tests working until Twilio config is done
+def twilio_signature_ok(request_url: str, form: dict, signature: str) -> bool:
+    # Dev bypass: only active if Twilio vars are unset
     if not TWILIO_AUTH_TOKEN or not WEBHOOK_PUBLIC_URL:
         return True
     validator = RequestValidator(TWILIO_AUTH_TOKEN)
     return validator.validate(request_url, form, signature)
+
+def register_message_sid(message_sid: str) -> bool:
+    """
+    Returns True if this MessageSid is a replay (already seen).
+    Returns False if it's new (and stores it).
+    """
+    if not message_sid:
+        # If signatures are enforced, missing SID is suspicious.
+        # In dev-bypass mode, Twilio vars may be blank; still treat missing as replay to be safe.
+        return True
+
+    conn = get_db()
+    row = conn.execute(
+        "SELECT 1 FROM message_dedup WHERE message_sid=?",
+        (message_sid,)
+    ).fetchone()
+
+    if row:
+        conn.close()
+        return True
+
+    conn.execute(
+        "INSERT INTO message_dedup (message_sid, first_seen_ts) VALUES (?,?)",
+        (message_sid, int(time.time()))
+    )
+    conn.commit()
+    conn.close()
+    return False
+
 # =====================
 # Parsing
 # =====================
@@ -320,23 +360,45 @@ async def whatsapp_webhook(request: Request):
     form = dict(await request.form())
     sender = form.get("From", "")
     body = form.get("Body", "")
+
+    # Optional debug to confirm what Twilio actually sends (TURN OFF after confirming)
+    if DEBUG_TWILIO_FORM_KEYS:
+        audit(sender, "DEBUG_FORM_KEYS", {"keys": sorted(list(form.keys()))})
+        audit(sender, "DEBUG_SID_FIELDS", {
+            "MessageSid": form.get("MessageSid"),
+            "SmsMessageSid": form.get("SmsMessageSid"),
+        })
+
+    # 1) Twilio signature verification (first line of defense)
     signature = request.headers.get("X-Twilio-Signature", "")
     request_url = WEBHOOK_PUBLIC_URL or str(request.url)
-    
+
     if not twilio_signature_ok(request_url, form, signature):
         audit(sender, "AUTH_FAIL", {"reason": "bad_twilio_signature"})
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    # 2) Replay protection (after signature passes)
+    # Twilio typically uses MessageSid, but include SmsMessageSid fallback.
+    message_sid = form.get("MessageSid") or form.get("SmsMessageSid") or ""
+
+    if register_message_sid(message_sid):
+        audit(sender, "REPLAY_REJECTED", {"message_sid": message_sid})
+        raise HTTPException(status_code=409, detail="Duplicate Message")
+
+    # 3) Record that a valid message arrived (metadata only)
     audit(sender, "MSG_RECEIVED", {"len": len(body)})
 
+    # 4) Sender allowlist
     if not sender_allowed(sender):
         audit(sender, "AUTH_FAIL", {"reason": "sender_not_allowed"})
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    # 5) Rate limit
     if not rate_limit_ok(sender):
         audit(sender, "RATE_LIMIT", {})
         return PlainTextResponse("Rate limit exceeded.", status_code=429)
 
+    # 6) Command parsing + execution
     cmd, arg = parse_command(body)
 
     if cmd is None:
