@@ -2,19 +2,28 @@ import os
 import time
 import json
 import sqlite3
+from pathlib import Path
 from typing import Optional, Tuple
 
+import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
-from dotenv import load_dotenv
 from twilio.request_validator import RequestValidator
+
+from app.ollama_client import ollama_suggest
+
+# =====================
+# Load .env (robust)
+# =====================
+ENV_PATH = Path(__file__).resolve().parents[1] / ".env"  # project root .env
+load_dotenv(dotenv_path=ENV_PATH)
 
 # =====================
 # Config
 # =====================
-load_dotenv()
-
 DB_PATH = os.getenv("DB_PATH", "./assistant.db")
+
 ALLOWED_SENDERS = {
     s.strip() for s in os.getenv("ALLOWED_SENDERS", "").split(",") if s.strip()
 }
@@ -23,8 +32,7 @@ RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 WEBHOOK_PUBLIC_URL = os.getenv("WEBHOOK_PUBLIC_URL", "").strip()
 
-# Set to "1" temporarily to log Twilio form keys / SID fields for verification.
-# Turn back to "0" after confirming.
+SUGGEST_RATE_LIMIT_PER_MIN = int(os.getenv("SUGGEST_RATE_LIMIT_PER_MIN", "5"))
 DEBUG_TWILIO_FORM_KEYS = os.getenv("DEBUG_TWILIO_FORM_KEYS", "0").strip() == "1"
 
 # =====================
@@ -36,7 +44,8 @@ app = FastAPI(title="WhatsApp Task Assistant")
 # Database
 # =====================
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout helps avoid immediate "database is locked" under light concurrency
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
@@ -115,6 +124,7 @@ def audit(sender: Optional[str], event_type: str, detail: dict):
 # Security
 # =====================
 _rate_bucket = {}
+_suggest_rate_bucket = {}
 
 def rate_limit_ok(sender: str) -> bool:
     now = int(time.time())
@@ -125,6 +135,16 @@ def rate_limit_ok(sender: str) -> bool:
     c += 1
     _rate_bucket[sender] = (w, c)
     return c <= RATE_LIMIT_PER_MIN
+
+def suggest_rate_limit_ok(sender: str) -> bool:
+    now = int(time.time())
+    window = now // 60
+    w, c = _suggest_rate_bucket.get(sender, (window, 0))
+    if w != window:
+        w, c = window, 0
+    c += 1
+    _suggest_rate_bucket[sender] = (w, c)
+    return c <= SUGGEST_RATE_LIMIT_PER_MIN
 
 def sender_allowed(sender: str) -> bool:
     return sender in ALLOWED_SENDERS
@@ -142,8 +162,6 @@ def register_message_sid(message_sid: str) -> bool:
     Returns False if it's new (and stores it).
     """
     if not message_sid:
-        # If signatures are enforced, missing SID is suspicious.
-        # In dev-bypass mode, Twilio vars may be blank; still treat missing as replay to be safe.
         return True
 
     conn = get_db()
@@ -172,8 +190,10 @@ ALLOWED_COMMANDS = {
     "/newlist",
     "/use",
     "/todo",
-    "/list",
+    "/list",   # open only
+    "/all",    # open + done
     "/done",
+    "/suggest",
 }
 
 def parse_command(body: str) -> Tuple[Optional[str], Optional[str]]:
@@ -294,9 +314,7 @@ def add_item(sender: str, text: str) -> int:
         (prefs["active_list_id"], text, "open", now, now),
     )
     conn.commit()
-    row = conn.execute(
-        "SELECT last_insert_rowid() AS id"
-    ).fetchone()
+    row = conn.execute("SELECT last_insert_rowid() AS id").fetchone()
     conn.close()
     return row["id"]
 
@@ -312,6 +330,29 @@ def get_items(sender: str):
     rows = conn.execute(
         "SELECT id,text,status FROM items WHERE list_id=? ORDER BY id",
         (prefs["active_list_id"],),
+    ).fetchall()
+
+    conn.close()
+    return dict(lst), [dict(r) for r in rows]
+
+def get_open_items_for_sender(sender: str, limit: int = 20):
+    prefs = get_or_create_prefs(sender)
+    conn = get_db()
+
+    lst = conn.execute(
+        "SELECT id,name FROM lists WHERE id=?",
+        (prefs["active_list_id"],),
+    ).fetchone()
+
+    rows = conn.execute(
+        """
+        SELECT id, text, created_at
+        FROM items
+        WHERE list_id=? AND status='open'
+        ORDER BY created_at ASC
+        LIMIT ?
+        """,
+        (prefs["active_list_id"], limit),
     ).fetchall()
 
     conn.close()
@@ -339,17 +380,31 @@ def mark_done(sender: str, item_id: int):
     conn.close()
 
 # =====================
-# Webhook
+# Webhook + Health
 # =====================
 HELP_TEXT = (
     "Commands:\n"
-    "/lists\n"
+    "/lists — show lists\n"
     "/newlist <name>\n"
     "/use <list_id>\n"
     "/todo <text>\n"
-    "/list\n"
-    "/done <item_id>"
+    "/list — show open items\n"
+    "/all — show open + done\n"
+    "/done <item_id>\n"
+    "/suggest\n"
 )
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+@app.get("/health/ollama")
+async def health_ollama():
+    base = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip()
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.get(f"{base}/api/tags")
+        r.raise_for_status()
+    return {"ok": True}
 
 @app.on_event("startup")
 def startup():
@@ -361,7 +416,6 @@ async def whatsapp_webhook(request: Request):
     sender = form.get("From", "")
     body = form.get("Body", "")
 
-    # Optional debug to confirm what Twilio actually sends (TURN OFF after confirming)
     if DEBUG_TWILIO_FORM_KEYS:
         audit(sender, "DEBUG_FORM_KEYS", {"keys": sorted(list(form.keys()))})
         audit(sender, "DEBUG_SID_FIELDS", {
@@ -369,23 +423,21 @@ async def whatsapp_webhook(request: Request):
             "SmsMessageSid": form.get("SmsMessageSid"),
         })
 
-    # 1) Twilio signature verification (first line of defense)
+    # 1) Twilio signature verification
     signature = request.headers.get("X-Twilio-Signature", "")
     request_url = WEBHOOK_PUBLIC_URL or str(request.url)
-
     if not twilio_signature_ok(request_url, form, signature):
         audit(sender, "AUTH_FAIL", {"reason": "bad_twilio_signature"})
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # 2) Replay protection (after signature passes)
-    # Twilio typically uses MessageSid, but include SmsMessageSid fallback.
+    # 2) Replay protection
     message_sid = form.get("MessageSid") or form.get("SmsMessageSid") or ""
-
     if register_message_sid(message_sid):
-        audit(sender, "REPLAY_REJECTED", {"message_sid": message_sid})
-        raise HTTPException(status_code=409, detail="Duplicate Message")
+        audit(sender, "REPLAY_IGNORED", {"message_sid": message_sid})
+        # Return 200 so Twilio doesn't retry forever
+        return PlainTextResponse("Duplicate ignored.", status_code=200)
 
-    # 3) Record that a valid message arrived (metadata only)
+    # 3) Audit
     audit(sender, "MSG_RECEIVED", {"len": len(body)})
 
     # 4) Sender allowlist
@@ -395,12 +447,11 @@ async def whatsapp_webhook(request: Request):
 
     # 5) Rate limit
     if not rate_limit_ok(sender):
-        audit(sender, "RATE_LIMIT", {})
+        audit(sender, "RATE_LIMIT", {"scope": "general"})
         return PlainTextResponse("Rate limit exceeded.", status_code=429)
 
-    # 6) Command parsing + execution
+    # 6) Parse command
     cmd, arg = parse_command(body)
-
     if cmd is None:
         return PlainTextResponse(HELP_TEXT)
 
@@ -413,13 +464,11 @@ async def whatsapp_webhook(request: Request):
 
         if cmd == "/lists":
             lists_ = list_lists()
-            return PlainTextResponse(
-                "Lists:\n" + "\n".join(f"{l['id']}: {l['name']}" for l in lists_)
-            )
+            return PlainTextResponse("Lists:\n" + "\n".join(f"{l['id']}: {l['name']}" for l in lists_))
 
         if cmd == "/newlist":
             if not arg:
-                return PlainTextResponse("Usage: /newlist <name>")
+                return PlainTextResponse("Usage: /newlist <name>\nExample: /newlist school")
             list_id = create_list(arg)
             audit(sender, "LIST_CREATED", {"list_id": list_id})
             return PlainTextResponse(f"Created list {list_id}.")
@@ -432,16 +481,26 @@ async def whatsapp_webhook(request: Request):
 
         if cmd == "/todo":
             if not arg:
-                return PlainTextResponse("Usage: /todo <text>")
+                return PlainTextResponse("Usage: /todo <text>\nExample: /todo buy eggs")
             item_id = add_item(sender, arg)
             audit(sender, "ITEM_CREATED", {"item_id": item_id})
             return PlainTextResponse(f"Added item {item_id}.")
 
         if cmd == "/list":
             lst, items = get_items(sender)
+            open_items = [it for it in items if it["status"] == "open"]
+            if not open_items:
+                return PlainTextResponse(f"List {lst['name']} has no open items.")
+            lines = [f"List {lst['id']}: {lst['name']} (open)"]
+            for it in open_items:
+                lines.append(f"• {it['id']}: {it['text']}")
+            return PlainTextResponse("\n".join(lines))
+
+        if cmd == "/all":
+            lst, items = get_items(sender)
             if not items:
                 return PlainTextResponse(f"List {lst['name']} is empty.")
-            lines = [f"List {lst['id']}: {lst['name']}"]
+            lines = [f"List {lst['id']}: {lst['name']} (all)"]
             for it in items:
                 prefix = "✅" if it["status"] == "done" else "•"
                 lines.append(f"{prefix} {it['id']}: {it['text']}")
@@ -452,6 +511,30 @@ async def whatsapp_webhook(request: Request):
             mark_done(sender, item_id)
             audit(sender, "ITEM_DONE", {"item_id": item_id})
             return PlainTextResponse(f"Marked {item_id} done.")
+
+        if cmd == "/suggest":
+            if not suggest_rate_limit_ok(sender):
+                audit(sender, "RATE_LIMIT", {"scope": "suggest"})
+                return PlainTextResponse("You’re spamming /suggest. Try again in a bit.", status_code=429)
+
+            lst, open_items = get_open_items_for_sender(sender, limit=20)
+            payload = {
+                "list": {"id": lst["id"], "name": lst["name"]},
+                "open_items": [{"id": x["id"], "text": x["text"]} for x in open_items],
+                "supported_commands": sorted(list(ALLOWED_COMMANDS)),
+                "advisory_only": True,
+            }
+
+            suggestion = await ollama_suggest(payload)
+
+            audit(sender, "LLM_SUGGEST", {
+                "list_id": lst["id"],
+                "n_open": len(open_items),
+                "out_len": len(suggestion),
+                "preview": suggestion[:200],
+            })
+
+            return PlainTextResponse("Suggestion:\n" + suggestion)
 
         return PlainTextResponse(HELP_TEXT)
 
