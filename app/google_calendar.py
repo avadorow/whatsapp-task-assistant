@@ -20,16 +20,18 @@ def build_flow(redirect_uri: str) -> Flow:
         scopes=SCOPES,
         redirect_uri=redirect_uri
     )
+    
 def creds_from_row(row) -> Credentials:
-    # Build Credentials object from database row so i don't have to reuse credentials over and over
+        # Build Credentials object from database row so i don't have to reuse credentials over and over
     return Credentials(
         token=row["access_token"],
-        refresh_token=row.get("refresh_token"),
-        token_uri=row.get("token_uri"),
-        client_id=row.get("client_id"),
-        client_secret=row.get("client_secret"),
-        scopes=json.loads(row.get("scopes")),
+        refresh_token=row["refresh_token"],   # <- change
+        token_uri=row["token_uri"],
+        client_id=row["client_id"],
+        client_secret=row["client_secret"],
+        scopes=json.loads(row["scopes"]),
     )
+
 def ensure_fresh_creds(creds: Credentials) -> Credentials:
     # Refresh credentials if expired and gets a new one if so 
     if creds.expired and creds.refresh_token:
@@ -54,4 +56,9 @@ def list_next_events(service,time_min_iso: str, max_results: int = 10) -> List[D
         .execute()
     )
     return resp.get("items", [])
+
+def freebusy(service, time_min_iso: str, time_max_iso: str, calendar_id: str = "primary"):
+    body = {"timeMin": time_min_iso, "timeMax": time_max_iso, "items": [{"id": calendar_id}]}
+    resp = service.freebusy().query(body=body).execute()
+    return resp.get("calendars", {}).get(calendar_id, {}).get("busy", [])
 

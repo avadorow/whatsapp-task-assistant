@@ -5,23 +5,25 @@ import sqlite3
 import asyncio
 from pathlib import Path
 from typing import Optional, Tuple
+from zoneinfo import ZoneInfo
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse
-from datetime import datetime
+from fastapi.params import Query
+from datetime import datetime, timedelta, timezone
 from app.google_calendar import (
     build_flow,
     creds_from_row,
     ensure_fresh_creds,
     calendar_service,
-    list_next_events,
-)
+    list_next_events,)
 from fastapi.responses import PlainTextResponse
 from twilio.request_validator import RequestValidator
-
 from app.ollama_client import ollama_suggest
-
+from app.availibility import build_free_blocks, build_free_any
+from app.google_calendar import freebusy
+from app.formatters import shape_blocks, blocks_to_whatsapp
 
 # Load .env (robust)
 
@@ -36,7 +38,7 @@ DB_PATH = os.getenv("DB_PATH", "./assistant.db")
 ALLOWED_SENDERS = {
     s.strip() for s in os.getenv("ALLOWED_SENDERS", "").split(",") if s.strip()
 }
-RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MINS", "30"))
 
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 WEBHOOK_PUBLIC_URL = os.getenv("WEBHOOK_PUBLIC_URL", "").strip()
@@ -611,7 +613,7 @@ def google_oauth_callback(state: str, code: str):
 #Super quick this reads calendar after connection
 @app.get("/calendar/test")
 def calendar_test(sender: str):
-    row = get_google_token_row(sender)
+    row = get_google_tokens(sender)
     if not row:
         raise HTTPException(status_code=401, detail="No Google OAuth tokens found for this sender.")
     creds = ensure_fresh_creds(creds_from_row(row))
@@ -625,8 +627,53 @@ def calendar_test(sender: str):
         start = (e.get('start', {}).get('dateTime') or e.get('start', {}).get('date'))
         simplified.append({"summary": e.get('summary'), "start": start})
     return {"okay": True, "events": simplified}
-    
 
+@app.get("/calendar/availability")
+def calendar_availability(sender: str, duration_minutes: int = 30):
+    row = get_google_tokens(sender)
+    if not row:
+        raise HTTPException(status_code=401, detail="No Google OAuth tokens found for this sender.")
+
+    creds = ensure_fresh_creds(creds_from_row(row))
+    svc = calendar_service(creds)
+
+    now_utc = datetime.now(timezone.utc)
+    end_utc = now_utc + timedelta(minutes=duration_minutes)
+
+    busy = freebusy(svc, now_utc.isoformat(), end_utc.isoformat(), calendar_id="primary")
+
+    free_any = build_free_any(busy, now_utc=now_utc, end_utc=end_utc)
+    free_allowed = build_free_blocks(busy, now_utc=now_utc, end_utc=end_utc)
+
+    tz_name = (os.getenv("TZ", "America/New_York") or "").strip() or "America/New_York"
+    tz = ZoneInfo(tz_name)
+    free_any_shaped = shape_blocks(free_any, tz)
+    free_allowed_shaped = shape_blocks(free_allowed, tz)
+
+    whatsapp_text = "\n".join(
+         s for s in [
+            blocks_to_whatsapp(free_any_shaped, "Free"),
+            blocks_to_whatsapp(free_allowed_shaped, "Allowed"),
+        ] if s
+    )
+
+
+    return {
+        "ok": True,
+        "tz": tz_name,
+        "range": {
+            "start_utc": now_utc.isoformat(),
+            "end_utc": end_utc.isoformat(),
+        },
+        "free_any": free_any_shaped,
+        "free_allowed": free_allowed_shaped,
+        "whatsapp_preview": whatsapp_text,
+    }
+
+
+
+
+# app startup and webhook
 @app.on_event("startup")
 async def startup():
     init_db()
