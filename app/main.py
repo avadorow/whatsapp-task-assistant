@@ -5,10 +5,18 @@ import sqlite3
 import asyncio
 from pathlib import Path
 from typing import Optional, Tuple
-
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import RedirectResponse
+from datetime import datetime
+from app.google_calendar import (
+    build_flow,
+    creds_from_row,
+    ensure_fresh_creds,
+    calendar_service,
+    list_next_events,
+)
 from fastapi.responses import PlainTextResponse
 from twilio.request_validator import RequestValidator
 
@@ -56,6 +64,26 @@ def init_db():
     cur = conn.cursor()
     now = int(time.time())
 
+    #Tabel
+    
+    #Make the auth table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS oauth_tokens (
+        sender TEXT NOT NULL,
+        provider TEXT NOT NULL,     -- 'google'
+        access_token TEXT NOT NULL,
+        refresh_token TEXT,
+        token_uri TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        client_secret TEXT NOT NULL,
+        scopes TEXT NOT NULL,       -- JSON array
+        expiry_ts INTEGER,          -- epoch seconds
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (sender, provider)
+    );
+    """)
+    
     cur.execute("""
     CREATE TABLE IF NOT EXISTS lists (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,6 +226,52 @@ def register_message_sid(message_sid: str) -> bool:
     conn.commit()
     conn.close()
     return False
+
+def upsert_google_tokens(sender: str, creds):
+    conn = get_db()
+    now = int(time.time())
+    
+    expiry_ts = None
+    if getattr(creds, "expiry", None):
+        try:
+            expiry_ts = int(creds.expiry.timestamp())
+        except Exception:
+            expiry_ts = None
+    conn.execute("""
+    INSERT INTO oauth_tokens (
+        sender, provider, access_token, refresh_token, token_uri, client_id, client_secret, scopes, expiry_ts, created_at, updated_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(sender, provider) DO UPDATE SET
+        access_token=excluded.access_token,
+        refresh_token=COALESCE(excluded.refresh_token, oauth_tokens.refresh_token),
+        token_uri=excluded.token_uri,
+        client_id=excluded.client_id,
+        client_secret=excluded.client_secret,
+        scopes=excluded.scopes,
+        expiry_ts=excluded.expiry_ts,
+        updated_at=excluded.updated_at  
+    """, (
+        sender,"google",
+        creds.token,
+        creds.refresh_token,
+        creds.token_uri,
+        creds.client_id,
+        creds.client_secret,
+        json.dumps(list(creds.scopes or [])),
+        expiry_ts,
+        now,now,
+    )) 
+    conn.commit()
+    conn.close()
+def get_google_tokens(sender: str):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM oauth_tokens WHERE sender=? AND provider='google'",
+        (sender,)
+    ).fetchone()
+    conn.close()
+    return row
+
 
 # Parsing
 
@@ -505,6 +579,53 @@ async def health_ollama():
         r = await client.get(f"{base}/api/tags")
         r.raise_for_status()
     return {"ok": True}
+
+#For the google oauth start endpoint and the following stuff 
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/oauth/google/callback").strip()
+
+@app.get("/oauth/google/start")
+def google_oauth_start(sender: str):
+    #Open a browser to this endpoint to start the google oauth flow
+    flow = build_flow(redirect_uri=GOOGLE_REDIRECT_URI)
+    auth_url, state = flow.authorization_url(
+        access_type='offline',
+        include_granted_scopes='true',
+        prompt='consent',
+        state=sender  # for demo purposes; in prod use a secure random state
+    )
+    
+    return RedirectResponse(auth_url)
+@app.get("/oauth/google/callback")
+def google_oauth_callback(state: str, code: str):
+    #Handle the oauth callback from google
+    sender = state  # in prod, validate state properly
+
+    flow = build_flow(redirect_uri=GOOGLE_REDIRECT_URI)
+    flow.fetch_token(code=code)
+
+    creds = flow.credentials
+    upsert_google_tokens(sender, creds)
+
+    return {"status": "success", "message": "Google OAuth successful. You can now use Google Calendar features.", "connected_sender": sender}
+
+#Super quick this reads calendar after connection
+@app.get("/calendar/test")
+def calendar_test(sender: str):
+    row = get_google_token_row(sender)
+    if not row:
+        raise HTTPException(status_code=401, detail="No Google OAuth tokens found for this sender.")
+    creds = ensure_fresh_creds(creds_from_row(row))
+    svc = calendar_service(creds)
+    
+    now = datetime.now(timezone.utc).isoformat()
+    events = list_next_events(svc, time_min_iso=now, max_results=5)
+    
+    simplified = []
+    for e in events:
+        start = (e.get('start', {}).get('dateTime') or e.get('start', {}).get('date'))
+        simplified.append({"summary": e.get('summary'), "start": start})
+    return {"okay": True, "events": simplified}
+    
 
 @app.on_event("startup")
 async def startup():
