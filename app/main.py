@@ -670,7 +670,9 @@ def calendar_availability(sender: str, duration_minutes: int = 30):
         "whatsapp_preview": whatsapp_text,
     }
 
-
+@app.get("/ping")
+def ping():
+    return{"ok": True, "msg": "pong"}
 
 
 # app startup and webhook
@@ -816,3 +818,16 @@ async def whatsapp_webhook(request: Request):
     except ValueError as e:
         audit(sender, "CMD_ERROR", {"error": str(e)})
         return PlainTextResponse(f"Error: {e}", status_code=400)
+@app.post("/twilio/inbound")
+async def twilio_inbound(request: Request):
+    #Twilio sends form-encoded data
+    form = await request.form()
+    body = (form.get("Body") or "").strip()
+    
+    #Reply with TwiML
+    reply = "pong" if body.lower() == "ping" else "pong"
+    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Message>{reply}</Message>
+</Response>"""
+    return PlainTextResponse(twiml_response, media_type="application/xml")
