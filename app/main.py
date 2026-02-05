@@ -3,6 +3,7 @@ import time
 import json
 import sqlite3
 import asyncio
+import html
 from pathlib import Path
 from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -24,6 +25,7 @@ from app.ollama_client import ollama_suggest
 from app.availibility import build_free_blocks, build_free_any
 from app.google_calendar import freebusy
 from app.formatters import shape_blocks, blocks_to_whatsapp
+from app.utils import normalize_sender
 
 # Load .env (robust)
 
@@ -229,46 +231,45 @@ def register_message_sid(message_sid: str) -> bool:
     conn.close()
     return False
 
+import os, json, sqlite3
+
+DB_PATH = os.getenv("DB_PATH", "assistant.db")
+
 def upsert_google_tokens(sender: str, creds):
-    conn = get_db()
-    now = int(time.time())
+    con = sqlite3.connect(DB_PATH)
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            INSERT INTO google_tokens (sender, access_token, refresh_token, token_uri, client_id, client_secret, scopes, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(sender) DO UPDATE SET
+              access_token=excluded.access_token,
+              refresh_token=excluded.refresh_token,
+              token_uri=excluded.token_uri,
+              client_id=excluded.client_id,
+              client_secret=excluded.client_secret,
+              scopes=excluded.scopes,
+              updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                sender,
+                creds.token,
+                creds.refresh_token,
+                creds.token_uri,
+                creds.client_id,
+                creds.client_secret,
+                json.dumps(list(creds.scopes or [])),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
     
-    expiry_ts = None
-    if getattr(creds, "expiry", None):
-        try:
-            expiry_ts = int(creds.expiry.timestamp())
-        except Exception:
-            expiry_ts = None
-    conn.execute("""
-    INSERT INTO oauth_tokens (
-        sender, provider, access_token, refresh_token, token_uri, client_id, client_secret, scopes, expiry_ts, created_at, updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(sender, provider) DO UPDATE SET
-        access_token=excluded.access_token,
-        refresh_token=COALESCE(excluded.refresh_token, oauth_tokens.refresh_token),
-        token_uri=excluded.token_uri,
-        client_id=excluded.client_id,
-        client_secret=excluded.client_secret,
-        scopes=excluded.scopes,
-        expiry_ts=excluded.expiry_ts,
-        updated_at=excluded.updated_at  
-    """, (
-        sender,"google",
-        creds.token,
-        creds.refresh_token,
-        creds.token_uri,
-        creds.client_id,
-        creds.client_secret,
-        json.dumps(list(creds.scopes or [])),
-        expiry_ts,
-        now,now,
-    )) 
-    conn.commit()
-    conn.close()
 def get_google_tokens(sender: str):
     conn = get_db()
     row = conn.execute(
-        "SELECT * FROM oauth_tokens WHERE sender=? AND provider='google'",
+        "SELECT * FROM google_tokens WHERE sender=?",
         (sender,)
     ).fetchone()
     conn.close()
@@ -587,29 +588,32 @@ GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/oa
 
 @app.get("/oauth/google/start")
 def google_oauth_start(sender: str):
-    #Open a browser to this endpoint to start the google oauth flow
+    sender_norm = normalize_sender(sender)
+
     flow = build_flow(redirect_uri=GOOGLE_REDIRECT_URI)
     auth_url, state = flow.authorization_url(
-        access_type='offline',
-        include_granted_scopes='true',
-        prompt='consent',
-        state=sender  # for demo purposes; in prod use a secure random state
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+        state=sender_norm,   # store normalized sender
     )
-    
     return RedirectResponse(auth_url)
+
+
 @app.get("/oauth/google/callback")
 def google_oauth_callback(state: str, code: str):
-    #Handle the oauth callback from google
-    sender = state  # in prod, validate state properly
+    sender_norm = normalize_sender(state)
 
     flow = build_flow(redirect_uri=GOOGLE_REDIRECT_URI)
     flow.fetch_token(code=code)
 
     creds = flow.credentials
-    upsert_google_tokens(sender, creds)
+    upsert_google_tokens(sender_norm, creds)
 
-    return {"status": "success", "message": "Google OAuth successful. You can now use Google Calendar features.", "connected_sender": sender}
-
+    return {
+        "status": "success",
+        "connected_sender": sender_norm,
+    }
 #Super quick this reads calendar after connection
 @app.get("/calendar/test")
 def calendar_test(sender: str):
@@ -684,8 +688,11 @@ async def startup():
 @app.post("/whatsapp")
 async def whatsapp_webhook(request: Request):
     form = dict(await request.form())
-    sender = form.get("From", "")
+    sender_raw = (form.get("From") or "").strip()
+    sender = normalize_sender(sender_raw)
     body = form.get("Body", "")
+    print("RAW:", sender_raw, "→ NORMALIZED:", sender)
+
 
     if DEBUG_TWILIO_FORM_KEYS:
         audit(sender, "DEBUG_FORM_KEYS", {"keys": sorted(list(form.keys()))})
@@ -818,16 +825,61 @@ async def whatsapp_webhook(request: Request):
     except ValueError as e:
         audit(sender, "CMD_ERROR", {"error": str(e)})
         return PlainTextResponse(f"Error: {e}", status_code=400)
+
 @app.post("/twilio/inbound")
 async def twilio_inbound(request: Request):
-    #Twilio sends form-encoded data
-    form = await request.form()
-    body = (form.get("Body") or "").strip()
     
-    #Reply with TwiML
-    reply = "pong" if body.lower() == "ping" else "pong"
-    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+
+    form = dict(await request.form())
+    body = (form.get("Body") or "").strip().lower()
+
+    raw_from = (form.get("From") or "").strip()
+    sender = normalize_sender(raw_from)
+    row = get_google_tokens(sender)
+
+
+    if body == "ping":
+        reply = "pong"
+
+    elif body in {"free", "availability", "avail"}:
+        row = get_google_tokens(sender)
+        
+        if not row:
+            reply = "No Google Calendar linked for this number."
+        else:
+            creds = ensure_fresh_creds(creds_from_row(row))
+            svc = calendar_service(creds)
+
+            duration_minutes = 240
+            now_utc = datetime.now(timezone.utc)
+            end_utc = now_utc + timedelta(minutes=duration_minutes)
+
+            busy = freebusy(svc, now_utc.isoformat(), end_utc.isoformat(), calendar_id="primary")
+
+            free_any = build_free_any(busy, now_utc=now_utc, end_utc=end_utc)
+            free_allowed = build_free_blocks(busy, now_utc=now_utc, end_utc=end_utc)
+
+            tz_name = (os.getenv("TZ", "America/New_York") or "").strip() or "America/New_York"
+            tz = ZoneInfo(tz_name)
+
+            free_any_shaped = shape_blocks(free_any, tz)
+            free_allowed_shaped = shape_blocks(free_allowed, tz)
+
+            parts = [
+                blocks_to_whatsapp(free_any_shaped, "Free"),
+                blocks_to_whatsapp(free_allowed_shaped, "Allowed"),
+            ]
+            reply = "\n".join([p for p in parts if p]) or "No free blocks found."
+
+    else:
+        reply = "Send 'ping' or 'free'."
+
+    # TwiML must be valid XML; escape special chars
+    reply_xml = html.escape(reply)
+
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Message>{reply}</Message>
+  <Message>{reply_xml}</Message>
 </Response>"""
-    return PlainTextResponse(twiml_response, media_type="application/xml")
+
+    return PlainTextResponse(twiml, media_type="application/xml")
