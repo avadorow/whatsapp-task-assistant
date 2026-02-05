@@ -2,6 +2,7 @@ import os
 import time
 import json
 import sqlite3
+import asyncio
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -13,15 +14,15 @@ from twilio.request_validator import RequestValidator
 
 from app.ollama_client import ollama_suggest
 
-# =====================
+
 # Load .env (robust)
-# =====================
+
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"  # project root .env
 load_dotenv(dotenv_path=ENV_PATH)
 
-# =====================
+
 # Config
-# =====================
+
 DB_PATH = os.getenv("DB_PATH", "./assistant.db")
 
 ALLOWED_SENDERS = {
@@ -35,14 +36,14 @@ WEBHOOK_PUBLIC_URL = os.getenv("WEBHOOK_PUBLIC_URL", "").strip()
 SUGGEST_RATE_LIMIT_PER_MIN = int(os.getenv("SUGGEST_RATE_LIMIT_PER_MIN", "5"))
 DEBUG_TWILIO_FORM_KEYS = os.getenv("DEBUG_TWILIO_FORM_KEYS", "0").strip() == "1"
 
-# =====================
+
 # App
-# =====================
+
 app = FastAPI(title="WhatsApp Task Assistant")
 
-# =====================
+
 # Database
-# =====================
+
 def get_db():
     # timeout helps avoid immediate "database is locked" under light concurrency
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -102,6 +103,22 @@ def init_db():
     );
     """)
 
+  #background job queue for slow tasks like /suggest
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender TEXT NOT NULL,
+        job_type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('queued','running','done','error')),
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        finished_at INTEGER,
+        result TEXT,
+        error TEXT
+    );
+    """)
+
     # Ensure default list exists
     cur.execute(
         "INSERT OR IGNORE INTO lists (name, created_at) VALUES (?,?)",
@@ -120,9 +137,9 @@ def audit(sender: Optional[str], event_type: str, detail: dict):
     conn.commit()
     conn.close()
 
-# =====================
+
 # Security
-# =====================
+
 _rate_bucket = {}
 _suggest_rate_bucket = {}
 
@@ -182,18 +199,18 @@ def register_message_sid(message_sid: str) -> bool:
     conn.close()
     return False
 
-# =====================
 # Parsing
-# =====================
+
 ALLOWED_COMMANDS = {
     "/lists",
     "/newlist",
     "/use",
     "/todo",
-    "/list",   # open only
-    "/all",    # open + done
+    "/list",           # open only
+    "/all",            # open + done
     "/done",
-    "/suggest",
+    "/suggest",        # enqueue suggestion job
+    "/suggest_result", # fetch last suggestion result
 }
 
 def parse_command(body: str) -> Tuple[Optional[str], Optional[str]]:
@@ -215,9 +232,8 @@ def parse_int(arg: Optional[str]) -> int:
         raise ValueError("Expected a numeric ID.")
     return int(arg)
 
-# =====================
+
 # Core logic
-# =====================
 def get_or_create_prefs(sender: str) -> dict:
     conn = get_db()
     now = int(time.time())
@@ -379,9 +395,92 @@ def mark_done(sender: str, item_id: int):
     conn.commit()
     conn.close()
 
-# =====================
+
+# Jobs: enqueue + fetch
+
+def enqueue_job(sender: str, job_type: str, payload: dict) -> int:
+    conn = get_db()
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO jobs (sender, job_type, payload, status, created_at) VALUES (?,?,?,?,?)",
+        (sender, job_type, json.dumps(payload), "queued", now),
+    )
+    conn.commit()
+    job_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.close()
+    return int(job_id)
+
+def get_latest_job(sender: str, job_type: str):
+    conn = get_db()
+    row = conn.execute(
+        """
+        SELECT id, status, result, error
+        FROM jobs
+        WHERE sender=? AND job_type=?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (sender, job_type),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+async def job_worker_loop():
+    """
+    Simple in-process worker for laptop dev.
+    Later, this becomes a separate worker process in cloud.
+    """
+    while True:
+        await asyncio.sleep(0.25)
+
+        conn = get_db()
+        job = conn.execute(
+            """
+            SELECT id, sender, payload
+            FROM jobs
+            WHERE status='queued' AND job_type='suggest'
+            ORDER BY id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+
+        if not job:
+            conn.close()
+            continue
+
+        job_id = int(job["id"])
+        sender = job["sender"]
+        payload = json.loads(job["payload"])
+
+        now = int(time.time())
+        conn.execute(
+            "UPDATE jobs SET status='running', started_at=? WHERE id=?",
+            (now, job_id),
+        )
+        conn.commit()
+        conn.close()
+
+        try:
+            suggestion = await ollama_suggest(payload)
+            conn = get_db()
+            now = int(time.time())
+            conn.execute(
+                "UPDATE jobs SET status='done', finished_at=?, result=? WHERE id=?",
+                (now, suggestion, job_id),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            conn = get_db()
+            now = int(time.time())
+            conn.execute(
+                "UPDATE jobs SET status='error', finished_at=?, error=? WHERE id=?",
+                (now, str(e), job_id),
+            )
+            conn.commit()
+            conn.close()
+
 # Webhook + Health
-# =====================
 HELP_TEXT = (
     "Commands:\n"
     "/lists — show lists\n"
@@ -391,7 +490,8 @@ HELP_TEXT = (
     "/list — show open items\n"
     "/all — show open + done\n"
     "/done <item_id>\n"
-    "/suggest\n"
+    "/suggest — generate suggestions (async)\n"
+    "/suggest_result — fetch latest suggestion\n"
 )
 
 @app.get("/health")
@@ -407,8 +507,9 @@ async def health_ollama():
     return {"ok": True}
 
 @app.on_event("startup")
-def startup():
+async def startup():
     init_db()
+    asyncio.create_task(job_worker_loop())
 
 @app.post("/whatsapp")
 async def whatsapp_webhook(request: Request):
@@ -434,7 +535,6 @@ async def whatsapp_webhook(request: Request):
     message_sid = form.get("MessageSid") or form.get("SmsMessageSid") or ""
     if register_message_sid(message_sid):
         audit(sender, "REPLAY_IGNORED", {"message_sid": message_sid})
-        # Return 200 so Twilio doesn't retry forever
         return PlainTextResponse("Duplicate ignored.", status_code=200)
 
     # 3) Audit
@@ -525,16 +625,23 @@ async def whatsapp_webhook(request: Request):
                 "advisory_only": True,
             }
 
-            suggestion = await ollama_suggest(payload)
+            job_id = enqueue_job(sender, "suggest", payload)
+            audit(sender, "SUGGEST_ENQUEUED", {"job_id": job_id, "n_open": len(open_items)})
 
-            audit(sender, "LLM_SUGGEST", {
-                "list_id": lst["id"],
-                "n_open": len(open_items),
-                "out_len": len(suggestion),
-                "preview": suggestion[:200],
-            })
+            return PlainTextResponse(f"Generating suggestion (job {job_id}). Reply /suggest_result in ~10 seconds.")
 
-            return PlainTextResponse("Suggestion:\n" + suggestion)
+        if cmd == "/suggest_result":
+            job = get_latest_job(sender, "suggest")
+            if not job:
+                return PlainTextResponse("No suggestion yet. Send /suggest first.")
+
+            if job["status"] in ("queued", "running"):
+                return PlainTextResponse(f"Still working (job {job['id']}). Try again in a few seconds.")
+
+            if job["status"] == "error":
+                return PlainTextResponse(f"Suggestion failed (job {job['id']}): {job.get('error','unknown error')}")
+
+            return PlainTextResponse("Suggestion:\n" + (job.get("result") or "Empty suggestion."))
 
         return PlainTextResponse(HELP_TEXT)
 

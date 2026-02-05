@@ -4,3 +4,7 @@ python-dotenv'
 python-multipart
 twilio
 httpx
+google-auth
+google-auth-oauthlib
+google-api-python-client
+python-dateutil

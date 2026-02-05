@@ -3,5 +3,5 @@ venv/
 assistant.db
 _pychache_/
 *.pyc
-
+app/secrets/
 #This tells git to ignore certain files and directories
