@@ -4,43 +4,50 @@ import json
 import sqlite3
 import asyncio
 import html
+import secrets
 from pathlib import Path
 from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import RedirectResponse
-from fastapi.params import Query
-from datetime import datetime, timedelta, timezone
+from fastapi.responses import RedirectResponse, PlainTextResponse
+from twilio.request_validator import RequestValidator
+
 from app.google_calendar import (
     build_flow,
     creds_from_row,
     ensure_fresh_creds,
     calendar_service,
-    list_next_events,)
-from fastapi.responses import PlainTextResponse
-from twilio.request_validator import RequestValidator
+    list_next_events,
+    freebusy,
+)
 from app.ollama_client import ollama_suggest
 from app.availibility import build_free_blocks, build_free_any
-from app.google_calendar import freebusy
 from app.formatters import shape_blocks, blocks_to_whatsapp
 from app.utils import normalize_sender
 
-# Load .env (robust)
-
+# =====================
+# Load .env
+# =====================
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"  # project root .env
 load_dotenv(dotenv_path=ENV_PATH)
 
-
+# =====================
 # Config
-
+# =====================
 DB_PATH = os.getenv("DB_PATH", "./assistant.db")
 
 ALLOWED_SENDERS = {
     s.strip() for s in os.getenv("ALLOWED_SENDERS", "").split(",") if s.strip()
 }
-RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MINS", "30"))
+
+# support both keys (you had a typo in one place)
+RATE_LIMIT_PER_MIN = int(
+    os.getenv("RATE_LIMIT_PER_MIN", os.getenv("RATE_LIMIT_PER_MINS", "30"))
+)
 
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 WEBHOOK_PUBLIC_URL = os.getenv("WEBHOOK_PUBLIC_URL", "").strip()
@@ -48,30 +55,35 @@ WEBHOOK_PUBLIC_URL = os.getenv("WEBHOOK_PUBLIC_URL", "").strip()
 SUGGEST_RATE_LIMIT_PER_MIN = int(os.getenv("SUGGEST_RATE_LIMIT_PER_MIN", "5"))
 DEBUG_TWILIO_FORM_KEYS = os.getenv("DEBUG_TWILIO_FORM_KEYS", "0").strip() == "1"
 
+GOOGLE_REDIRECT_URI = os.getenv(
+    "GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/oauth/google/callback"
+).strip()
 
+STATE_TTL_SEC = 10 * 60  # 10 minutes
+
+# =====================
 # App
-
+# =====================
 app = FastAPI(title="WhatsApp Task Assistant")
 
-
+# =====================
 # Database
-
+# =====================
 def get_db():
-    # timeout helps avoid immediate "database is locked" under light concurrency
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
+
 
 def init_db():
     conn = get_db()
     cur = conn.cursor()
     now = int(time.time())
 
-    #Tabel
-    
-    #Make the auth table
-    cur.execute("""
+    # OAuth tokens (google)
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS oauth_tokens (
         sender TEXT NOT NULL,
         provider TEXT NOT NULL,     -- 'google'
@@ -86,17 +98,39 @@ def init_db():
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (sender, provider)
     );
-    """)
-    
-    cur.execute("""
+    """
+    )
+
+    # OAuth one-time state tickets (CSRF + sender binding)
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS oauth_states (
+        state TEXT PRIMARY KEY,
+        sender TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0
+    );
+    """
+    )
+    cur.execute(
+        """
+    CREATE INDEX IF NOT EXISTS idx_oauth_states_created_at
+    ON oauth_states (created_at);
+    """
+    )
+
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS lists (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
         created_at INTEGER NOT NULL
     );
-    """)
+    """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS preferences (
         sender TEXT PRIMARY KEY,
         active_list_id INTEGER,
@@ -104,9 +138,11 @@ def init_db():
         updated_at INTEGER NOT NULL,
         FOREIGN KEY(active_list_id) REFERENCES lists(id)
     );
-    """)
+    """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         list_id INTEGER NOT NULL,
@@ -116,9 +152,11 @@ def init_db():
         updated_at INTEGER NOT NULL,
         FOREIGN KEY(list_id) REFERENCES lists(id)
     );
-    """)
+    """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS audit_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts INTEGER NOT NULL,
@@ -126,17 +164,20 @@ def init_db():
         event_type TEXT NOT NULL,
         detail TEXT NOT NULL
     );
-    """)
+    """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS message_dedup (
         message_sid TEXT PRIMARY KEY,
         first_seen_ts INTEGER NOT NULL
     );
-    """)
+    """
+    )
 
-  #background job queue for slow tasks like /suggest
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sender TEXT NOT NULL,
@@ -149,7 +190,8 @@ def init_db():
         result TEXT,
         error TEXT
     );
-    """)
+    """
+    )
 
     # Ensure default list exists
     cur.execute(
@@ -159,6 +201,7 @@ def init_db():
 
     conn.commit()
     conn.close()
+
 
 def audit(sender: Optional[str], event_type: str, detail: dict):
     conn = get_db()
@@ -170,10 +213,116 @@ def audit(sender: Optional[str], event_type: str, detail: dict):
     conn.close()
 
 
-# Security
+# =====================
+# OAuth state helpers
+# =====================
+def create_oauth_state(sender_norm: str) -> str:
+    state = secrets.token_urlsafe(32)
+    now = int(time.time())
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO oauth_states(state, sender, created_at, used) VALUES (?,?,?,0)",
+        (state, sender_norm, now),
+    )
+    conn.commit()
+    conn.close()
+    return state
 
+
+def consume_oauth_state(state: str) -> str:
+    now = int(time.time())
+    conn = get_db()
+    row = conn.execute(
+        "SELECT sender, created_at, used FROM oauth_states WHERE state=?",
+        (state,),
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid state")
+
+    if int(row["used"]) == 1:
+        conn.close()
+        raise HTTPException(status_code=400, detail="State already used")
+
+    if now - int(row["created_at"]) > STATE_TTL_SEC:
+        conn.close()
+        raise HTTPException(status_code=400, detail="State expired")
+
+    conn.execute("UPDATE oauth_states SET used=1 WHERE state=?", (state,))
+    conn.commit()
+    sender = row["sender"]
+    conn.close()
+    return sender
+
+
+# =====================
+# Google token storage
+# =====================
+def upsert_google_tokens(sender: str, creds) -> None:
+    now = int(time.time())
+    conn = get_db()
+
+    # Keep existing refresh token if Google doesn't resend it
+    existing = conn.execute(
+        "SELECT refresh_token FROM oauth_tokens WHERE sender=? AND provider='google'",
+        (sender,),
+    ).fetchone()
+    existing_refresh = existing["refresh_token"] if existing else None
+    refresh_token = creds.refresh_token or existing_refresh
+
+    expiry_ts = int(creds.expiry.timestamp()) if getattr(creds, "expiry", None) else None
+
+    conn.execute(
+        """
+        INSERT INTO oauth_tokens (
+            sender, provider, access_token, refresh_token, token_uri,
+            client_id, client_secret, scopes, expiry_ts, created_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(sender, provider) DO UPDATE SET
+            access_token=excluded.access_token,
+            refresh_token=excluded.refresh_token,
+            token_uri=excluded.token_uri,
+            client_id=excluded.client_id,
+            client_secret=excluded.client_secret,
+            scopes=excluded.scopes,
+            expiry_ts=excluded.expiry_ts,
+            updated_at=excluded.updated_at
+        """,
+        (
+            sender,
+            "google",
+            creds.token,
+            refresh_token,
+            creds.token_uri,
+            creds.client_id,
+            creds.client_secret,
+            json.dumps(list(creds.scopes or [])),
+            expiry_ts,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_google_tokens(sender: str):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM oauth_tokens WHERE sender=? AND provider='google'",
+        (sender,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+# =====================
+# Security + rate limiting
+# =====================
 _rate_bucket = {}
 _suggest_rate_bucket = {}
+
 
 def rate_limit_ok(sender: str) -> bool:
     now = int(time.time())
@@ -185,6 +334,7 @@ def rate_limit_ok(sender: str) -> bool:
     _rate_bucket[sender] = (w, c)
     return c <= RATE_LIMIT_PER_MIN
 
+
 def suggest_rate_limit_ok(sender: str) -> bool:
     now = int(time.time())
     window = now // 60
@@ -195,8 +345,10 @@ def suggest_rate_limit_ok(sender: str) -> bool:
     _suggest_rate_bucket[sender] = (w, c)
     return c <= SUGGEST_RATE_LIMIT_PER_MIN
 
+
 def sender_allowed(sender: str) -> bool:
     return sender in ALLOWED_SENDERS
+
 
 def twilio_signature_ok(request_url: str, form: dict, signature: str) -> bool:
     # Dev bypass: only active if Twilio vars are unset
@@ -204,6 +356,7 @@ def twilio_signature_ok(request_url: str, form: dict, signature: str) -> bool:
         return True
     validator = RequestValidator(TWILIO_AUTH_TOKEN)
     return validator.validate(request_url, form, signature)
+
 
 def register_message_sid(message_sid: str) -> bool:
     """
@@ -216,7 +369,7 @@ def register_message_sid(message_sid: str) -> bool:
     conn = get_db()
     row = conn.execute(
         "SELECT 1 FROM message_dedup WHERE message_sid=?",
-        (message_sid,)
+        (message_sid,),
     ).fetchone()
 
     if row:
@@ -225,70 +378,28 @@ def register_message_sid(message_sid: str) -> bool:
 
     conn.execute(
         "INSERT INTO message_dedup (message_sid, first_seen_ts) VALUES (?,?)",
-        (message_sid, int(time.time()))
+        (message_sid, int(time.time())),
     )
     conn.commit()
     conn.close()
     return False
 
-import os, json, sqlite3
 
-DB_PATH = os.getenv("DB_PATH", "assistant.db")
-
-def upsert_google_tokens(sender: str, creds):
-    con = sqlite3.connect(DB_PATH)
-    try:
-        cur = con.cursor()
-        cur.execute(
-            """
-            INSERT INTO google_tokens (sender, access_token, refresh_token, token_uri, client_id, client_secret, scopes, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(sender) DO UPDATE SET
-              access_token=excluded.access_token,
-              refresh_token=excluded.refresh_token,
-              token_uri=excluded.token_uri,
-              client_id=excluded.client_id,
-              client_secret=excluded.client_secret,
-              scopes=excluded.scopes,
-              updated_at=CURRENT_TIMESTAMP
-            """,
-            (
-                sender,
-                creds.token,
-                creds.refresh_token,
-                creds.token_uri,
-                creds.client_id,
-                creds.client_secret,
-                json.dumps(list(creds.scopes or [])),
-            ),
-        )
-        con.commit()
-    finally:
-        con.close()
-    
-def get_google_tokens(sender: str):
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM google_tokens WHERE sender=?",
-        (sender,)
-    ).fetchone()
-    conn.close()
-    return row
-
-
+# =====================
 # Parsing
-
+# =====================
 ALLOWED_COMMANDS = {
     "/lists",
     "/newlist",
     "/use",
     "/todo",
-    "/list",           # open only
-    "/all",            # open + done
+    "/list",  # open only
+    "/all",  # open + done
     "/done",
-    "/suggest",        # enqueue suggestion job
-    "/suggest_result", # fetch last suggestion result
+    "/suggest",  # enqueue suggestion job
+    "/suggest_result",  # fetch last suggestion result
 }
+
 
 def parse_command(body: str) -> Tuple[Optional[str], Optional[str]]:
     body = (body or "").strip()
@@ -304,28 +415,26 @@ def parse_command(body: str) -> Tuple[Optional[str], Optional[str]]:
 
     return cmd, arg
 
+
 def parse_int(arg: Optional[str]) -> int:
     if not arg or not arg.isdigit():
         raise ValueError("Expected a numeric ID.")
     return int(arg)
 
 
-# Core logic
+# =====================
+# Core list logic
+# =====================
 def get_or_create_prefs(sender: str) -> dict:
     conn = get_db()
     now = int(time.time())
 
-    row = conn.execute(
-        "SELECT * FROM preferences WHERE sender=?", (sender,)
-    ).fetchone()
-
+    row = conn.execute("SELECT * FROM preferences WHERE sender=?", (sender,)).fetchone()
     if row:
         conn.close()
         return dict(row)
 
-    todo = conn.execute(
-        "SELECT id FROM lists WHERE name='todo'"
-    ).fetchone()
+    todo = conn.execute("SELECT id FROM lists WHERE name='todo'").fetchone()
 
     conn.execute(
         "INSERT INTO preferences (sender, active_list_id, created_at, updated_at) VALUES (?,?,?,?)",
@@ -333,11 +442,10 @@ def get_or_create_prefs(sender: str) -> dict:
     )
     conn.commit()
 
-    row = conn.execute(
-        "SELECT * FROM preferences WHERE sender=?", (sender,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM preferences WHERE sender=?", (sender,)).fetchone()
     conn.close()
     return dict(row)
+
 
 def create_list(name: str) -> int:
     name = name.strip().lower()
@@ -352,27 +460,20 @@ def create_list(name: str) -> int:
     now = int(time.time())
 
     try:
-        conn.execute(
-            "INSERT INTO lists (name, created_at) VALUES (?,?)",
-            (name, now),
-        )
+        conn.execute("INSERT INTO lists (name, created_at) VALUES (?,?)", (name, now))
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
         raise ValueError("List already exists.")
 
-    row = conn.execute(
-        "SELECT id FROM lists WHERE name=?", (name,)
-    ).fetchone()
+    row = conn.execute("SELECT id FROM lists WHERE name=?", (name,)).fetchone()
     conn.close()
     return row["id"]
 
+
 def set_active_list(sender: str, list_id: int) -> str:
     conn = get_db()
-    row = conn.execute(
-        "SELECT id,name FROM lists WHERE id=?", (list_id,)
-    ).fetchone()
-
+    row = conn.execute("SELECT id,name FROM lists WHERE id=?", (list_id,)).fetchone()
     if not row:
         conn.close()
         raise ValueError("List not found.")
@@ -386,13 +487,13 @@ def set_active_list(sender: str, list_id: int) -> str:
     conn.close()
     return row["name"]
 
+
 def list_lists() -> list:
     conn = get_db()
-    rows = conn.execute(
-        "SELECT id,name FROM lists ORDER BY id"
-    ).fetchall()
+    rows = conn.execute("SELECT id,name FROM lists ORDER BY id").fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
 
 def add_item(sender: str, text: str) -> int:
     prefs = get_or_create_prefs(sender)
@@ -411,13 +512,13 @@ def add_item(sender: str, text: str) -> int:
     conn.close()
     return row["id"]
 
+
 def get_items(sender: str):
     prefs = get_or_create_prefs(sender)
     conn = get_db()
 
     lst = conn.execute(
-        "SELECT id,name FROM lists WHERE id=?",
-        (prefs["active_list_id"],),
+        "SELECT id,name FROM lists WHERE id=?", (prefs["active_list_id"],)
     ).fetchone()
 
     rows = conn.execute(
@@ -428,13 +529,13 @@ def get_items(sender: str):
     conn.close()
     return dict(lst), [dict(r) for r in rows]
 
+
 def get_open_items_for_sender(sender: str, limit: int = 20):
     prefs = get_or_create_prefs(sender)
     conn = get_db()
 
     lst = conn.execute(
-        "SELECT id,name FROM lists WHERE id=?",
-        (prefs["active_list_id"],),
+        "SELECT id,name FROM lists WHERE id=?", (prefs["active_list_id"],)
     ).fetchone()
 
     rows = conn.execute(
@@ -451,6 +552,7 @@ def get_open_items_for_sender(sender: str, limit: int = 20):
     conn.close()
     return dict(lst), [dict(r) for r in rows]
 
+
 def mark_done(sender: str, item_id: int):
     prefs = get_or_create_prefs(sender)
     conn = get_db()
@@ -465,16 +567,14 @@ def mark_done(sender: str, item_id: int):
         raise ValueError("Item not found in active list.")
 
     now = int(time.time())
-    conn.execute(
-        "UPDATE items SET status='done', updated_at=? WHERE id=?",
-        (now, item_id),
-    )
+    conn.execute("UPDATE items SET status='done', updated_at=? WHERE id=?", (now, item_id))
     conn.commit()
     conn.close()
 
 
+# =====================
 # Jobs: enqueue + fetch
-
+# =====================
 def enqueue_job(sender: str, job_type: str, payload: dict) -> int:
     conn = get_db()
     now = int(time.time())
@@ -486,6 +586,7 @@ def enqueue_job(sender: str, job_type: str, payload: dict) -> int:
     job_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.close()
     return int(job_id)
+
 
 def get_latest_job(sender: str, job_type: str):
     conn = get_db()
@@ -502,11 +603,8 @@ def get_latest_job(sender: str, job_type: str):
     conn.close()
     return dict(row) if row else None
 
+
 async def job_worker_loop():
-    """
-    Simple in-process worker for laptop dev.
-    Later, this becomes a separate worker process in cloud.
-    """
     while True:
         await asyncio.sleep(0.25)
 
@@ -557,7 +655,10 @@ async def job_worker_loop():
             conn.commit()
             conn.close()
 
-# Webhook + Health
+
+# =====================
+# Health
+# =====================
 HELP_TEXT = (
     "Commands:\n"
     "/lists — show lists\n"
@@ -583,58 +684,63 @@ async def health_ollama():
         r.raise_for_status()
     return {"ok": True}
 
-#For the google oauth start endpoint and the following stuff 
-GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/oauth/google/callback").strip()
 
+# =====================
+# Google OAuth routes
+# =====================
 @app.get("/oauth/google/start")
 def google_oauth_start(sender: str):
     sender_norm = normalize_sender(sender)
+    state = create_oauth_state(sender_norm)
 
     flow = build_flow(redirect_uri=GOOGLE_REDIRECT_URI)
-    auth_url, state = flow.authorization_url(
+    auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
-        state=sender_norm,   # store normalized sender
+        state=state,
     )
     return RedirectResponse(auth_url)
 
 
 @app.get("/oauth/google/callback")
 def google_oauth_callback(state: str, code: str):
-    sender_norm = normalize_sender(state)
+    sender_norm = consume_oauth_state(state)
 
     flow = build_flow(redirect_uri=GOOGLE_REDIRECT_URI)
     flow.fetch_token(code=code)
 
-    creds = flow.credentials
-    upsert_google_tokens(sender_norm, creds)
+    upsert_google_tokens(sender_norm, flow.credentials)
+    return {"status": "success", "connected_sender": sender_norm}
 
-    return {
-        "status": "success",
-        "connected_sender": sender_norm,
-    }
-#Super quick this reads calendar after connection
+
+# =====================
+# Calendar endpoints
+# =====================
 @app.get("/calendar/test")
 def calendar_test(sender: str):
-    row = get_google_tokens(sender)
+    sender_norm = normalize_sender(sender)
+    row = get_google_tokens(sender_norm)
     if not row:
         raise HTTPException(status_code=401, detail="No Google OAuth tokens found for this sender.")
+
     creds = ensure_fresh_creds(creds_from_row(row))
     svc = calendar_service(creds)
-    
+
     now = datetime.now(timezone.utc).isoformat()
     events = list_next_events(svc, time_min_iso=now, max_results=5)
-    
+
     simplified = []
     for e in events:
-        start = (e.get('start', {}).get('dateTime') or e.get('start', {}).get('date'))
-        simplified.append({"summary": e.get('summary'), "start": start})
-    return {"okay": True, "events": simplified}
+        start = (e.get("start", {}).get("dateTime") or e.get("start", {}).get("date"))
+        simplified.append({"summary": e.get("summary"), "start": start})
+    return {"ok": True, "events": simplified}
+
 
 @app.get("/calendar/availability")
 def calendar_availability(sender: str, duration_minutes: int = 30):
-    row = get_google_tokens(sender)
+    sender_norm = normalize_sender(sender)
+    row = get_google_tokens(sender_norm)
     if not row:
         raise HTTPException(status_code=401, detail="No Google OAuth tokens found for this sender.")
 
@@ -655,51 +761,55 @@ def calendar_availability(sender: str, duration_minutes: int = 30):
     free_allowed_shaped = shape_blocks(free_allowed, tz)
 
     whatsapp_text = "\n".join(
-         s for s in [
+        s
+        for s in [
             blocks_to_whatsapp(free_any_shaped, "Free"),
             blocks_to_whatsapp(free_allowed_shaped, "Allowed"),
-        ] if s
+        ]
+        if s
     )
-
 
     return {
         "ok": True,
         "tz": tz_name,
-        "range": {
-            "start_utc": now_utc.isoformat(),
-            "end_utc": end_utc.isoformat(),
-        },
+        "range": {"start_utc": now_utc.isoformat(), "end_utc": end_utc.isoformat()},
         "free_any": free_any_shaped,
         "free_allowed": free_allowed_shaped,
         "whatsapp_preview": whatsapp_text,
     }
 
+
 @app.get("/ping")
 def ping():
-    return{"ok": True, "msg": "pong"}
+    return {"ok": True, "msg": "pong"}
 
 
-# app startup and webhook
+# =====================
+# Startup
+# =====================
 @app.on_event("startup")
 async def startup():
     init_db()
     asyncio.create_task(job_worker_loop())
 
+
+# =====================
+# WhatsApp webhook (tasks)
+# =====================
 @app.post("/whatsapp")
 async def whatsapp_webhook(request: Request):
     form = dict(await request.form())
     sender_raw = (form.get("From") or "").strip()
     sender = normalize_sender(sender_raw)
     body = form.get("Body", "")
-    print("RAW:", sender_raw, "→ NORMALIZED:", sender)
-
 
     if DEBUG_TWILIO_FORM_KEYS:
         audit(sender, "DEBUG_FORM_KEYS", {"keys": sorted(list(form.keys()))})
-        audit(sender, "DEBUG_SID_FIELDS", {
-            "MessageSid": form.get("MessageSid"),
-            "SmsMessageSid": form.get("SmsMessageSid"),
-        })
+        audit(
+            sender,
+            "DEBUG_SID_FIELDS",
+            {"MessageSid": form.get("MessageSid"), "SmsMessageSid": form.get("SmsMessageSid")},
+        )
 
     # 1) Twilio signature verification
     signature = request.headers.get("X-Twilio-Signature", "")
@@ -741,7 +851,9 @@ async def whatsapp_webhook(request: Request):
 
         if cmd == "/lists":
             lists_ = list_lists()
-            return PlainTextResponse("Lists:\n" + "\n".join(f"{l['id']}: {l['name']}" for l in lists_))
+            return PlainTextResponse(
+                "Lists:\n" + "\n".join(f"{l['id']}: {l['name']}" for l in lists_)
+            )
 
         if cmd == "/newlist":
             if not arg:
@@ -792,7 +904,9 @@ async def whatsapp_webhook(request: Request):
         if cmd == "/suggest":
             if not suggest_rate_limit_ok(sender):
                 audit(sender, "RATE_LIMIT", {"scope": "suggest"})
-                return PlainTextResponse("You’re spamming /suggest. Try again in a bit.", status_code=429)
+                return PlainTextResponse(
+                    "You’re spamming /suggest. Try again in a bit.", status_code=429
+                )
 
             lst, open_items = get_open_items_for_sender(sender, limit=20)
             payload = {
@@ -804,8 +918,9 @@ async def whatsapp_webhook(request: Request):
 
             job_id = enqueue_job(sender, "suggest", payload)
             audit(sender, "SUGGEST_ENQUEUED", {"job_id": job_id, "n_open": len(open_items)})
-
-            return PlainTextResponse(f"Generating suggestion (job {job_id}). Reply /suggest_result in ~10 seconds.")
+            return PlainTextResponse(
+                f"Generating suggestion (job {job_id}). Reply /suggest_result in ~10 seconds."
+            )
 
         if cmd == "/suggest_result":
             job = get_latest_job(sender, "suggest")
@@ -813,10 +928,14 @@ async def whatsapp_webhook(request: Request):
                 return PlainTextResponse("No suggestion yet. Send /suggest first.")
 
             if job["status"] in ("queued", "running"):
-                return PlainTextResponse(f"Still working (job {job['id']}). Try again in a few seconds.")
+                return PlainTextResponse(
+                    f"Still working (job {job['id']}). Try again in a few seconds."
+                )
 
             if job["status"] == "error":
-                return PlainTextResponse(f"Suggestion failed (job {job['id']}): {job.get('error','unknown error')}")
+                return PlainTextResponse(
+                    f"Suggestion failed (job {job['id']}): {job.get('error','unknown error')}"
+                )
 
             return PlainTextResponse("Suggestion:\n" + (job.get("result") or "Empty suggestion."))
 
@@ -826,24 +945,24 @@ async def whatsapp_webhook(request: Request):
         audit(sender, "CMD_ERROR", {"error": str(e)})
         return PlainTextResponse(f"Error: {e}", status_code=400)
 
+
+# =====================
+# Twilio inbound (calendar)
+# =====================
 @app.post("/twilio/inbound")
 async def twilio_inbound(request: Request):
-    
-
     form = dict(await request.form())
     body = (form.get("Body") or "").strip().lower()
 
     raw_from = (form.get("From") or "").strip()
     sender = normalize_sender(raw_from)
-    row = get_google_tokens(sender)
-
 
     if body == "ping":
         reply = "pong"
 
     elif body in {"free", "availability", "avail"}:
         row = get_google_tokens(sender)
-        
+
         if not row:
             reply = "No Google Calendar linked for this number."
         else:
@@ -857,7 +976,7 @@ async def twilio_inbound(request: Request):
             busy = freebusy(svc, now_utc.isoformat(), end_utc.isoformat(), calendar_id="primary")
 
             free_any = build_free_any(busy, now_utc=now_utc, end_utc=end_utc)
-            free_allowed = build_free_blocks(busy, now_utc=now_utc, end_utc=end_utc)
+            free_allowed = build_free_blocks(busy, now_utc=now_utc, end_utc=end_utc, min_block_min=30)
 
             tz_name = (os.getenv("TZ", "America/New_York") or "").strip() or "America/New_York"
             tz = ZoneInfo(tz_name)
@@ -874,12 +993,9 @@ async def twilio_inbound(request: Request):
     else:
         reply = "Send 'ping' or 'free'."
 
-    # TwiML must be valid XML; escape special chars
     reply_xml = html.escape(reply)
-
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Message>{reply_xml}</Message>
 </Response>"""
-
     return PlainTextResponse(twiml, media_type="application/xml")
